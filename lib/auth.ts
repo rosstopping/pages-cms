@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { passwordAuthOptions } from "@/lib/password-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { nextCookies } from "better-auth/next-js";
 import { emailOTP } from "better-auth/plugins";
@@ -15,6 +16,7 @@ import { render } from "@react-email/render";
 export const auth = betterAuth({
   baseURL: getBaseUrl(),
   secret: (process.env.AUTH_SECRET || process.env.BETTER_AUTH_SECRET) as string,
+  emailAndPassword: passwordAuthOptions,
   user: {
     additionalFields: {
       githubUsername: {
@@ -163,6 +165,17 @@ export const auth = betterAuth({
       resendStrategy: "reuse",
       sendVerificationOTP: async ({ email, otp, type }) => {
         if (type !== "sign-in") return;
+
+        // Preserve legacy invitations without allowing public account registration.
+        const existingUser = await db.query.userTable.findFirst({
+          where: (table, { eq }) => eq(table.email, email.toLowerCase()),
+        });
+        const invitation = await db.query.collaboratorTable.findFirst({
+          where: (table, { eq }) => eq(table.email, email.toLowerCase()),
+        });
+        if (!existingUser && !invitation) {
+          throw new Error("This email has not been invited.");
+        }
 
         const subject = `Your Pages CMS temporary code is ${otp}`;
         const html = await render(

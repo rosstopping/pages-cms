@@ -78,7 +78,7 @@ Notes:
 
 - In production, `BASE_URL` should be the single canonical URL for the app.
 - Do not mix a custom domain and a `*.netlify.app` URL for the same install.
-- `ADMIN_EMAILS` is a comma-separated allowlist for access to the admin panel.
+- `ADMIN_EMAILS` is a comma-separated allowlist for access to the admin panel and collaborator password management. Set it to the email used by your GitHub administrator account.
 
 Generate secrets with:
 
@@ -138,3 +138,28 @@ For more detail, see:
 ## License
 
 Everything in this repo is released under the [MIT License](LICENSE).
+
+### Collaborator password logins
+
+Administrators listed in `ADMIN_EMAILS` can create email/password accounts from a
+repository's **Collaborators** page. Sign in with GitHub to manage the repository,
+choose **Add collaborator**, and enter an email and a password of 12–128 characters.
+Share the credentials directly; this flow sends no invitation email.
+
+For an existing account, leave the password blank to add repository access without
+changing its credentials. Use **Set password** in the collaborator menu to create
+or replace its password, including for existing email-code collaborators. This
+signs the account out of all existing sessions. One account/password is shared
+across repositories. Removing a collaborator removes that repository's access,
+not the login account. Administrator accounts continue to use GitHub sign-in.
+
+The sign-in page accepts email and password alongside GitHub. There is no public
+password registration or forgot-password flow; contact the administrator for a
+replacement password. Existing invitation links retain their email-code flow.
+Passwords are hashed using Better Auth's configured password hasher and never
+returned in collaborator responses. No database migration is required.
+
+Authentication integration checks can be run with Node.js 22.18+ using
+`node --test tests/password-auth.test.mjs`. These exercise Better Auth with an
+in-memory adapter; testing collaborator creation and repository access also
+requires a configured PostgreSQL database and GitHub App.

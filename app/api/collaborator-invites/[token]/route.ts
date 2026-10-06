@@ -64,9 +64,9 @@ const maskEmail = (email: string) => {
 
 const claimInvite = async (
   invite: typeof collaboratorInviteTable.$inferSelect,
-  user: { id: string; email: string },
+  user: { id: string; email: string; emailVerified: boolean },
 ) => {
-  if (normalizeEmail(user.email) !== normalizeEmail(invite.email)) {
+  if (!user.emailVerified || normalizeEmail(user.email) !== normalizeEmail(invite.email)) {
     return false;
   }
 

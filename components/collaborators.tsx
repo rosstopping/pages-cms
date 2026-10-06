@@ -7,6 +7,7 @@ import {
   handleAddCollaborator,
   handleRemoveCollaborator,
   handleResendCollaboratorInvite,
+  handleSetCollaboratorPassword,
 } from "@/lib/actions/collaborator";
 import { useRepoHeader } from "@/components/repo/repo-header-context";
 import { Button } from "@/components/ui/button";
@@ -46,7 +47,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import { useUser } from "@/contexts/user-context";
 import {
   Tooltip,
   TooltipContent,
@@ -95,43 +97,36 @@ function InviteCollaboratorsDialog({
   triggerVariant?: "default" | "outline";
   triggerSize?: "default" | "sm";
 }) {
-  const parsedInviteEmails = useMemo(() => {
-    return Array.from(
-      new Set(
-        value
-          .split(/[\n,]+/)
-          .map((email) => email.trim())
-          .filter(Boolean),
-      ),
-    );
-  }, [value]);
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>
         <Button variant={triggerVariant} size={triggerSize} disabled={disabled}>
-          {triggerLabel || "Invite"}
+          {triggerLabel || "Add collaborator"}
         </Button>
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Invite collaborators</DialogTitle>
+          <DialogTitle>Add collaborator</DialogTitle>
           <DialogDescription>
-            Enter one or multiple email addresses, separated by commas or new
-            lines.
+            Create an email and password login, then share the details directly.
+            For an existing account, leave password blank to add repository access.
           </DialogDescription>
         </DialogHeader>
         <form action={action} className="space-y-4">
           <input type="hidden" name="owner" value={owner} />
           <input type="hidden" name="repo" value={repo} />
-          <Textarea
-            name="emails"
-            placeholder="alice@example.com, bob@example.com"
+          <Input
+            type="email"
+            name="email"
+            aria-label="Email"
+            placeholder="Email"
             value={value}
             onChange={(event) => onValueChange(event.target.value)}
             required
-            rows={6}
           />
+          <Input type="password" name="password" placeholder="Password (new accounts)"
+            aria-label="Password for new account" autoComplete="new-password" minLength={12} maxLength={128} />
+          <p className="text-sm text-muted-foreground">New passwords need at least 12 characters.</p>
           {state?.error ? (
             <p className="text-sm font-medium text-destructive">
               {state.error}
@@ -140,9 +135,9 @@ function InviteCollaboratorsDialog({
           <DialogFooter>
             <SubmitButton
               type="submit"
-              disabled={parsedInviteEmails.length === 0}
+              disabled={!value.trim()}
             >
-              Send invite{parsedInviteEmails.length > 1 ? "s" : ""}
+              Add collaborator
             </SubmitButton>
           </DialogFooter>
         </form>
@@ -160,6 +155,9 @@ export function Collaborators({
   repo: string;
   branch?: string;
 }) {
+  const { user } = useUser();
+  const [passwordTarget, setPasswordTarget] = useState<Collaborator | null>(null);
+  const [passwordState, passwordAction, passwordPending] = useActionState(handleSetCollaboratorPassword, { message: "" });
   const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
   const [addCollaboratorState, addCollaboratorAction] = useActionState<
     AddCollaboratorState,
@@ -173,6 +171,13 @@ export function Collaborators({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | undefined | null>(null);
 
+  useEffect(() => {
+    if (passwordState.message) {
+      toast.success(passwordState.message);
+      setPasswordTarget(null);
+    }
+  }, [passwordState]);
+
   const addNewCollaborator = useCallback((newCollaborators: Collaborator[]) => {
     setCollaborators((prevCollaborators) => {
       const seenIds = new Set(
@@ -181,7 +186,8 @@ export function Collaborators({
       const uniqueCollaborators = newCollaborators.filter(
         (collaborator) => !seenIds.has(collaborator.id),
       );
-      return [...prevCollaborators, ...uniqueCollaborators];
+      return [...prevCollaborators.map(existing =>
+        newCollaborators.find(updated => updated.id === existing.id) || existing), ...uniqueCollaborators];
     });
   }, []);
 
@@ -293,7 +299,7 @@ export function Collaborators({
   };
 
   const headerNode = useMemo(() => {
-    const showInviteAction = !isLoading && !error && collaborators.length > 0;
+    const showInviteAction = user?.isAdmin && !isLoading && !error && collaborators.length > 0;
 
     return (
       <div className="flex items-center justify-between gap-2">
@@ -338,6 +344,7 @@ export function Collaborators({
       </div>
     );
   }, [
+    user?.isAdmin,
     addCollaboratorAction,
     addCollaboratorState,
     collaborators.length,
@@ -400,6 +407,29 @@ export function Collaborators({
 
   return (
     <div className="h-full flex flex-col gap-4">
+      <Dialog open={Boolean(passwordTarget)} onOpenChange={(open) => {
+        if (!passwordPending && !open) setPasswordTarget(null);
+      }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Set password</DialogTitle>
+            <DialogDescription>
+              Set a new password for {passwordTarget?.email}. This changes their login
+              across all repositories and signs them out of existing sessions.
+            </DialogDescription>
+          </DialogHeader>
+          {passwordTarget && <form key={passwordTarget.id} action={passwordAction} className="space-y-4">
+            <input type="hidden" name="owner" value={owner} />
+            <input type="hidden" name="repo" value={repo} />
+            <input type="hidden" name="collaboratorId" value={passwordTarget.id} />
+            <Input type="password" name="password" aria-label="New password" placeholder="New password"
+              autoComplete="new-password" minLength={12} maxLength={128} required disabled={passwordPending} />
+            <p className="text-sm text-muted-foreground">Use at least 12 characters. Share the new password directly.</p>
+            {passwordState.error && <p className="text-sm text-destructive">{passwordState.error}</p>}
+            <DialogFooter><SubmitButton disabled={passwordPending}>Save password</SubmitButton></DialogFooter>
+          </form>}
+        </DialogContent>
+      </Dialog>
       {isLoading ? (
         loadingSkeleton
       ) : collaborators.length > 0 ? (
@@ -444,6 +474,11 @@ export function Collaborators({
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
+                    {user?.isAdmin && (
+                      <DropdownMenuItem onClick={() => setPasswordTarget(collaborator)}>
+                        Set password
+                      </DropdownMenuItem>
+                    )}
                     <DropdownMenuItem
                       onClick={() => void handleResendInvite(collaborator.id)}
                       disabled={
@@ -504,11 +539,11 @@ export function Collaborators({
             <EmptyHeader>
               <EmptyTitle>No collaborators</EmptyTitle>
               <EmptyDescription>
-                Invite collaborators to give them access to this repository.
+                Add collaborators to give them access to this repository.
               </EmptyDescription>
             </EmptyHeader>
             <EmptyContent>
-              <InviteCollaboratorsDialog
+              {user?.isAdmin && <InviteCollaboratorsDialog
                 owner={owner}
                 repo={repo}
                 state={addCollaboratorState}
@@ -518,10 +553,10 @@ export function Collaborators({
                 value={emails}
                 onValueChange={setEmails}
                 disabled={isLoading}
-                triggerLabel="Invite a collaborator"
+                triggerLabel="Add collaborator"
                 triggerVariant="default"
                 triggerSize="default"
-              />
+              />}
             </EmptyContent>
           </Empty>
         </div>

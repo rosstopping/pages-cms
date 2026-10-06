@@ -5,10 +5,11 @@ import type { User } from "@/types/user";
 
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
-const collaboratorMatchesUser = (user: Pick<User, "id" | "email">) => (
+const collaboratorMatchesUser = (user: Pick<User, "id" | "email"> & Partial<Pick<User, "emailVerified">>) => (
   or(
     eq(collaboratorTable.userId, user.id),
     and(
+      sql`${user.emailVerified === true}`,
       isNull(collaboratorTable.userId),
       sql`lower(${collaboratorTable.email}) = lower(${user.email})`,
     ),
@@ -16,7 +17,7 @@ const collaboratorMatchesUser = (user: Pick<User, "id" | "email">) => (
 );
 
 const collaboratorMatchesUserForRepo = (
-  user: Pick<User, "id" | "email">,
+  user: Pick<User, "id" | "email"> & Partial<Pick<User, "emailVerified">>,
   owner: string,
   repo: string,
 ) => (

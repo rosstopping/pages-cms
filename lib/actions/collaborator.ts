@@ -5,27 +5,17 @@ import { auth } from "@/lib/auth";
 import { getInstallationRepos, getInstallations } from "@/lib/github-app";
 import { requireGithubRepoWriteAccess } from "@/lib/authz-server";
 import { InviteEmailTemplate } from "@/components/email/invite";
-import { CollaboratorAddedEmailTemplate } from "@/components/email/collaborator-added";
 import { render } from "@react-email/render";
 import { sendEmail } from "@/lib/mailer";
 import { getBaseUrl } from "@/lib/base-url";
 import { db } from "@/db";
 import { and, eq, sql } from "drizzle-orm";
-import { collaboratorInviteTable, collaboratorTable } from "@/db/schema";
+import { accountTable, sessionTable, userTable, collaboratorInviteTable, collaboratorTable } from "@/db/schema";
 import { z } from "zod";
-import { randomBytes } from "crypto";
-import { findVerifiedUserByEmail, normalizeEmail } from "@/lib/collaborator-access";
+import { randomBytes, randomUUID } from "crypto";
+import { normalizeEmail } from "@/lib/collaborator-access";
 
-const parseInviteEmails = (raw: FormDataEntryValue | null) => {
-  const value = typeof raw === "string" ? raw : "";
-  const parts = value
-    .split(/[\n,]+/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  const unique = Array.from(new Set(parts.map((email) => email.toLowerCase())));
-  return z.array(z.string().email()).safeParse(unique);
-};
+import { requireAdminSession, isBootstrapAdminEmail } from "@/lib/admin";
 
 const assertRepoInInstallation = async (
   user: { id: string; githubUsername?: string | null },
@@ -108,158 +98,122 @@ const createCollaboratorInviteUrl = async ({
   return inviteUrl.toString();
 };
 
-// Invite a collaborator to a repository.
-const handleAddCollaborator = async (prevState: any, formData: FormData) => {
-	try {
-		// TODO: remove the requirement for Github account, let any collaborator invite others
-		const session = await auth.api.getSession({
-      headers: await headers(),
-    });
-    const user = session?.user;
-		if (!user) throw new Error("You must be signed in with GitHub to invite collaborators.");
-
-		// TODO: add support for branches
-		const ownerAndRepoValidation = z.object({
-			owner: z.string().trim().min(1),
-			repo: z.string().trim().min(1),
-		}).safeParse({
-			owner: formData.get("owner"),
-			repo: formData.get("repo")
-		});
-		if (!ownerAndRepoValidation.success) throw new Error ("Invalid owner and/or repo");
-
-		const owner = ownerAndRepoValidation.data.owner;
-		const repo = ownerAndRepoValidation.data.repo;
-
-    const emailsValidation = parseInviteEmails(formData.get("emails") ?? formData.get("email"));
-		if (!emailsValidation.success || emailsValidation.data.length === 0) throw new Error("Invalid email list");
-    const emails = emailsValidation.data;
-
-    const { repoAccess, installation } = await assertRepoInInstallation(user, owner, repo);
-
-		const baseUrl = getBaseUrl();
-    const repoUrl = new URL(`/${owner}/${repo}`, baseUrl).toString();
-    const createdCollaborators: (typeof collaboratorTable.$inferSelect)[] = [];
-    const errors: string[] = [];
-    let immediateAccessCount = 0;
-    let pendingInviteCount = 0;
-
-    for (const email of emails) {
-      const normalizedEmail = normalizeEmail(email);
-      const existingUser = await findVerifiedUserByEmail(normalizedEmail);
-      const collaborator = await db.query.collaboratorTable.findFirst({
-				where: and(
-        eq(collaboratorTable.ownerId, repoAccess.ownerId),
-        eq(collaboratorTable.repoId, repoAccess.repoId),
-					sql`lower(${collaboratorTable.email}) = lower(${normalizedEmail})`
-      ),
-			});
-      if (collaborator) {
-        if (existingUser && collaborator.userId !== existingUser.id) {
-          const updated = await db.update(collaboratorTable)
-            .set({ userId: existingUser.id })
-            .where(eq(collaboratorTable.id, collaborator.id))
-            .returning();
-          if (updated.length > 0) {
-            createdCollaborators.push(...updated);
-            immediateAccessCount += 1;
-          }
-        }
-        errors.push(`${normalizedEmail} is already invited to "${owner}/${repo}".`);
-        continue;
-      }
-
-      if (!existingUser) {
-        const inviteUrl = await createCollaboratorInviteUrl({
-          email: normalizedEmail,
-          owner,
-          repo,
-          baseUrl,
+// Provision one account and repository membership atomically. Existing credentials
+// are never replaced by adding access to another repository.
+const handleAddCollaborator = async (_prevState: unknown, formData: FormData) => {
+  try {
+    const { user } = await requireAdminSession();
+    const input = z.object({
+      owner: z.string().trim().min(1),
+      repo: z.string().trim().min(1),
+      email: z.string().trim().email().transform(normalizeEmail),
+      password: z.string().max(128).refine(value => value === "" || value.length >= 12,
+        "Use at least 12 characters for the password."),
+    }).parse(Object.fromEntries(formData));
+    const { repoAccess, installation } = await assertRepoInInstallation(user, input.owner, input.repo);
+    if (isBootstrapAdminEmail(input.email)) {
+      throw new Error("Administrator accounts must use GitHub sign-in.");
+    }
+    const context = await auth.$context;
+    const hash = input.password ? await context.password.hash(input.password) : null;
+    const collaborator = await db.transaction(async (tx) => {
+      // Serialize provisioning/reset of the same email, including across repositories.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${input.email}))`);
+      let target = await tx.query.userTable.findFirst({
+        where: sql`lower(${userTable.email}) = ${input.email}`,
+      });
+      if (!target) {
+        if (!hash) throw new Error("Enter a password for the new account.");
+        [target] = await tx.insert(userTable).values({
+          id: randomUUID(), name: input.email, email: input.email, emailVerified: false,
+        }).returning();
+        await tx.insert(accountTable).values({
+          id: randomUUID(), userId: target.id, accountId: target.id,
+          providerId: "credential", password: hash,
         });
-        try {
-          const html = await render(
-            InviteEmailTemplate({
-              inviteUrl,
-              repoName: `${formData.get("owner")}/${formData.get("repo")}`,
-              email: normalizedEmail,
-              invitedByName: user.name || user.githubUsername || user.email,
-              invitedByUrl: `https://github.com/${user.githubUsername}`,
-            }),
-          );
-          await sendEmail({
-            to: normalizedEmail,
-            subject: `Join "${owner}/${repo}" on Pages CMS`,
-            html,
-          });
-        } catch (error: any) {
-          console.error(`Failed to send invitation email to ${normalizedEmail}:`, error.message);
-          errors.push(`${normalizedEmail}: ${error.message}`);
-          continue;
-        }
+      } else if (hash) {
+        throw new Error("This account already exists. Leave password blank to add access, then use Set password if needed.");
+      }
+      const existing = await tx.query.collaboratorTable.findFirst({
+        where: and(eq(collaboratorTable.repoId, repoAccess.repoId),
+          eq(collaboratorTable.ownerId, repoAccess.ownerId),
+          sql`lower(${collaboratorTable.email}) = ${input.email}`),
+      });
+      const membership = { userId: target.id, invitedBy: user.id };
+      const [result] = existing
+        ? await tx.update(collaboratorTable).set(membership)
+          .where(eq(collaboratorTable.id, existing.id)).returning()
+        : await tx.insert(collaboratorTable).values({
+          ...membership, type: repoAccess.ownerType, installationId: installation.id,
+          ownerId: repoAccess.ownerId, repoId: repoAccess.repoId,
+          owner: repoAccess.ownerLogin, repo: repoAccess.repoName, email: input.email,
+        }).returning();
+      await tx.delete(collaboratorInviteTable).where(and(
+        sql`lower(${collaboratorInviteTable.email}) = ${input.email}`,
+        sql`lower(${collaboratorInviteTable.owner}) = lower(${input.owner})`,
+        sql`lower(${collaboratorInviteTable.repo}) = lower(${input.repo})`,
+      ));
+      return result;
+    });
+    return { message: `${input.email} now has access to ${input.owner}/${input.repo}. Share login details directly.`, data: [collaborator] };
+  } catch (error) {
+    return { error: error instanceof z.ZodError ? error.issues[0].message
+      : error instanceof Error ? error.message : "Could not add collaborator." };
+  }
+};
+
+const handleSetCollaboratorPassword = async (_prevState: unknown, formData: FormData) => {
+  try {
+    const { user } = await requireAdminSession();
+    const input = z.object({
+      owner: z.string().trim().min(1), repo: z.string().trim().min(1),
+      collaboratorId: z.coerce.number().int().positive(),
+      password: z.string().min(12).max(128),
+    }).parse(Object.fromEntries(formData));
+    const { repoAccess } = await assertRepoInInstallation(user, input.owner, input.repo);
+    const context = await auth.$context;
+    const hash = await context.password.hash(input.password);
+    await db.transaction(async (tx) => {
+      const collaborator = await tx.query.collaboratorTable.findFirst({
+        where: and(eq(collaboratorTable.id, input.collaboratorId),
+          eq(collaboratorTable.ownerId, repoAccess.ownerId),
+          eq(collaboratorTable.repoId, repoAccess.repoId)),
+      });
+      if (!collaborator) throw new Error("Collaborator not found in this repository.");
+      if (isBootstrapAdminEmail(collaborator.email)) {
+        throw new Error("Administrator accounts must use GitHub sign-in.");
+      }
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${normalizeEmail(collaborator.email)}))`);
+      let target = await tx.query.userTable.findFirst({
+        where: collaborator.userId ? eq(userTable.id, collaborator.userId)
+          : sql`lower(${userTable.email}) = lower(${collaborator.email})`,
+      });
+      if (!target) {
+        [target] = await tx.insert(userTable).values({
+          id: randomUUID(), name: collaborator.email, email: normalizeEmail(collaborator.email), emailVerified: false,
+        }).returning();
+      }
+      if (isBootstrapAdminEmail(target.email)) throw new Error("Administrator accounts must use GitHub sign-in.");
+      const credentials = await tx.query.accountTable.findFirst({
+        where: and(eq(accountTable.userId, target.id), eq(accountTable.providerId, "credential")),
+      });
+      if (credentials) {
+        await tx.update(accountTable).set({ password: hash, updatedAt: new Date() })
+          .where(eq(accountTable.id, credentials.id));
       } else {
-        try {
-          const html = await render(
-            CollaboratorAddedEmailTemplate({
-              email: normalizedEmail,
-              repoName: `${formData.get("owner")}/${formData.get("repo")}`,
-              repoUrl,
-              invitedByName: user.name || user.githubUsername || user.email,
-              invitedByUrl: `https://github.com/${user.githubUsername}`,
-            }),
-          );
-          await sendEmail({
-            to: normalizedEmail,
-            subject: `You were added to "${owner}/${repo}" on Pages CMS`,
-            html,
-          });
-        } catch (error: any) {
-          console.error(`Failed to send collaborator notification email to ${normalizedEmail}:`, error.message);
-          errors.push(`${normalizedEmail}: ${error.message}`);
-        }
+        await tx.insert(accountTable).values({
+          id: randomUUID(), userId: target.id, accountId: target.id, providerId: "credential", password: hash,
+        });
       }
-
-      const inserted = await db.insert(collaboratorTable).values({
-        type: repoAccess.ownerType,
-        installationId: installation.id,
-        ownerId: repoAccess.ownerId,
-        repoId: repoAccess.repoId,
-        owner: repoAccess.ownerLogin,
-        repo: repoAccess.repoName,
-        email: normalizedEmail,
-        userId: existingUser?.id ?? null,
-        invitedBy: user.id
-      }).returning();
-
-      if (inserted.length > 0) {
-        createdCollaborators.push(...inserted);
-        if (existingUser) {
-          immediateAccessCount += 1;
-        } else {
-          pendingInviteCount += 1;
-        }
-      }
-    }
-
-    if (createdCollaborators.length === 0) {
-      throw new Error(errors.join(" "));
-    }
-
-		return {
-      message:
-        immediateAccessCount > 0 && pendingInviteCount > 0
-          ? `${immediateAccessCount} collaborator${immediateAccessCount === 1 ? "" : "s"} added immediately and ${pendingInviteCount} invite${pendingInviteCount === 1 ? "" : "s"} sent for "${owner}/${repo}".`
-          : immediateAccessCount > 0
-            ? `${immediateAccessCount} collaborator${immediateAccessCount === 1 ? "" : "s"} added to "${owner}/${repo}".`
-            : pendingInviteCount === 1
-              ? `${createdCollaborators[0].email} invited to "${owner}/${repo}".`
-              : `${pendingInviteCount} collaborators invited to "${owner}/${repo}".`,
-			data: createdCollaborators,
-      errors
-		};
-	} catch (error: any) {
-		console.error(error);
-		return { error: error.message };
-	}
+      await tx.update(collaboratorTable).set({ userId: target.id })
+        .where(eq(collaboratorTable.id, collaborator.id));
+      await tx.delete(sessionTable).where(eq(sessionTable.userId, target.id));
+    });
+    return { message: "Password saved. Existing sessions have been signed out." };
+  } catch (error) {
+    return { error: error instanceof z.ZodError ? "Use a password between 12 and 128 characters."
+      : error instanceof Error ? error.message : "Could not set password." };
+  }
 };
 
 // Remove a collaborator from a repository.
@@ -349,4 +303,4 @@ const handleResendCollaboratorInvite = async (collaboratorId: number, owner: str
   }
 };
 
-export { handleAddCollaborator, handleRemoveCollaborator, handleResendCollaboratorInvite };
+export { handleAddCollaborator, handleRemoveCollaborator, handleResendCollaboratorInvite, handleSetCollaboratorPassword };
